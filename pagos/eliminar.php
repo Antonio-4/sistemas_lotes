@@ -1,78 +1,61 @@
 <?php
 session_start();
-
-// Validar que el usuario esté autenticado
-if (!isset($_SESSION['user'])) {
-    echo "ERROR: Sesión no válida.";
-    exit();
-}
-
 include("../conexion.php");
 
-// Obtener y validar ID del pago
+// Verificación de sesión de administrador
+if (!isset($_SESSION['user']) || ($_SESSION['rol'] ?? '') !== 'admin') {
+    die("ACCESO_DENEGADO");
+}
+
 $id = intval($_GET['id'] ?? 0);
 
 if ($id <= 0) {
-    echo "ERROR: ID de pago no válido.";
-    exit();
+    die("ID_INVALIDO");
 }
 
-// 1. Obtener el id_propietario antes de eliminar para poder recalcular su saldo
-$sql_info = "SELECT id_propietario FROM pagos WHERE id = ?";
-$stmt_info = $conn->prepare($sql_info);
+// 1. Obtener el id_propietario antes de borrar el pago
+$sqlGetProp = "SELECT id_propietario FROM pagos WHERE id = ?";
+$stmtGet = $conn->prepare($sqlGetProp);
+$stmtGet->bind_param("i", $id);
+$stmtGet->execute();
+$resGet = $stmtGet->get_result();
 
-if ($stmt_info) {
-    $stmt_info->bind_param("i", $id);
-    $stmt_info->execute();
-    $res = $stmt_info->get_result();
-    $pago = $res->fetch_assoc();
-    $stmt_info->close();
+if ($resGet->num_rows === 0) {
+    die("PAGO_NO_ENCONTRADO");
+}
 
-    if (!$pago) {
-        echo "ERROR: El pago no existe en la base de datos.";
-        exit();
-    }
+$row = $resGet->fetch_assoc();
+$id_propietario = $row['id_propietario'];
 
-    $id_propietario = $pago['id_propietario'];
+// 2. ELIMINAR FÍSICAMENTE EL PAGO DE LA BASE DE DATOS
+$sqlDelete = "DELETE FROM pagos WHERE id = ?";
+$stmtDel = $conn->prepare($sqlDelete);
+$stmtDel->bind_param("i", $id);
 
-    // 2. Eliminar el registro del pago
-    $sql_delete = "DELETE FROM pagos WHERE id = ?";
-    $stmt_del = $conn->prepare($sql_delete);
+if (!$stmtDel->execute()) {
+    die("ERROR_AL_ELIMINAR: " . $stmtDel->error);
+}
 
-    if ($stmt_del) {
-        $stmt_del->bind_param("i", $id);
+// 3. Recalcular el saldo descontando solo los pagos existentes en la BD
+$sqlSaldo = "
+UPDATE propietarios p
+SET saldo = GREATEST(
+    p.deuda_total - (
+        SELECT IFNULL(SUM(pa.monto), 0)
+        FROM pagos pa
+        WHERE pa.id_propietario = p.id
+    ),
+    0
+)
+WHERE p.id = ?
+";
 
-        if ($stmt_del->execute()) {
-            $stmt_del->close();
+$stmtSaldo = $conn->prepare($sqlSaldo);
+$stmtSaldo->bind_param("i", $id_propietario);
 
-            // 3. Recalcular y actualizar el saldo del propietario
-            $sql_update_saldo = "
-                UPDATE propietarios p
-                SET saldo = deuda_total - (
-                    SELECT IFNULL(SUM(total), 0)
-                    FROM pagos pa
-                    WHERE pa.id_propietario = p.id
-                )
-                WHERE id = ?
-            ";
-
-            $stmt_saldo = $conn->prepare($sql_update_saldo);
-            $stmt_saldo->bind_param("i", $id_propietario);
-            $stmt_saldo->execute();
-            $stmt_saldo->close();
-
-            // Respuesta esperada por el JS para remover la fila de la interfaz
-            echo "OK";
-            exit();
-        } else {
-            echo "Error al ejecutar la eliminación: " . $stmt_del->error;
-        }
-    } else {
-        echo "Error en la consulta DELETE: " . $conn->error;
-    }
+if ($stmtSaldo->execute()) {
+    echo "OK";
 } else {
-    echo "Error en la consulta SELECT: " . $conn->error;
+    echo "ERROR_RECALCULO: " . $stmtSaldo->error;
 }
-
-$conn->close();
 ?>
